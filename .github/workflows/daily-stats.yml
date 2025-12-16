@@ -1,0 +1,26 @@
+name: Daily Stats
+
+on:
+  schedule:
+    # 9am CET = 8am UTC (winter) / 7am UTC (summer)
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+jobs:
+  daily-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - run: pip install requests
+      
+      - name: Send daily report
+        env:
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          POSTHOG_PROJECT_ID: ${{ vars.POSTHOG_PROJECT_ID }}
+          SLACK_WEBHOOK_DAILY: ${{ secrets.SLACK_WEBHOOK_DAILY }}
+        run: python daily_slack_reporter.py
