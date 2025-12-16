@@ -2,7 +2,7 @@
 """
 PostHog → Slack Error Reporter
 ==============================
-Checks for errors every 10 mins and posts to Slack.
+Checks for errors every 10 mins and posts to Slack with error details and session replays.
 
 Environment variables:
     POSTHOG_API_KEY       - Your PostHog personal API key
@@ -31,6 +31,19 @@ HEADERS = {
     "Authorization": f"Bearer {POSTHOG_API_KEY}",
     "Content-Type": "application/json"
 }
+
+# Error events to monitor
+ERROR_EVENTS = {
+    "app_error_captured": "🐛 App Error",
+    "$exception": "💥 Exception",
+    "buy_provider_availability_error": "💳 Payment Error",
+    "send_transaction_result": "📤 Send Failure",
+    "swap_execution_result": "🔄 Swap Failure",
+    "$rageclick": "😤 Rage Click"
+}
+
+# Max errors to show per type (no limit)
+MAX_ERRORS_PER_TYPE = 100
 
 
 def check_config():
@@ -64,43 +77,82 @@ def query_posthog(query: str) -> dict:
     return response.json()
 
 
-def get_event_count_by_os(event_name: str, date_from: str, date_to: str) -> dict:
-    """Get event counts by OS."""
-    query = f"""
-        SELECT properties.$os as os, count() as count
-        FROM events
-        WHERE event = '{event_name}'
-            AND timestamp >= '{date_from}' AND timestamp < '{date_to}'
-            AND (properties.$os = 'iOS' OR properties.$os = 'Android')
-        GROUP BY os ORDER BY count DESC
-    """
-    result = query_posthog(query)
-    counts = {"iOS": 0, "Android": 0}
-    if result:
-        for row in result.get("results", []):
-            if row[0] in counts:
-                counts[row[0]] = row[1]
-    return counts
-
-
-def get_error_counts(date_from: str, date_to: str) -> dict:
-    """Get error counts by type and OS."""
-    error_events = [
-        "app_error_captured",
-        "$exception",
-        "buy_provider_availability_error",
-        "send_transaction_result",
-        "swap_execution_result",
-        "$rageclick"
-    ]
+def get_error_details(date_from: str, date_to: str) -> dict:
+    """Get detailed error info including messages and session IDs."""
     
-    errors = {}
-    for event in error_events:
-        counts = get_event_count_by_os(event, date_from, date_to)
-        total = counts["iOS"] + counts["Android"]
-        if total > 0:
-            errors[event] = counts
-    return errors
+    errors_by_type = {}
+    
+    for event, friendly_name in ERROR_EVENTS.items():
+        # Build query based on event type to get relevant error message
+        if event == "$exception":
+            message_field = "properties.$exception_message"
+        elif event == "app_error_captured":
+            message_field = "properties.error_message"
+        elif event == "buy_provider_availability_error":
+            message_field = "properties.provider"
+        elif event in ["send_transaction_result", "swap_execution_result"]:
+            message_field = "properties.error"
+        else:
+            message_field = "properties.message"
+        
+        query = f"""
+            SELECT 
+                properties.$os as os,
+                {message_field} as error_message,
+                properties.$session_id as session_id,
+                distinct_id,
+                timestamp,
+                properties.$current_url as url
+            FROM events
+            WHERE event = '{event}'
+                AND timestamp >= '{date_from}' 
+                AND timestamp < '{date_to}'
+                AND (properties.$os = 'iOS' OR properties.$os = 'Android')
+            ORDER BY timestamp DESC
+            LIMIT 100
+        """
+        
+        result = query_posthog(query)
+        
+        if result and result.get("results"):
+            errors_by_type[event] = {
+                "name": friendly_name,
+                "errors": []
+            }
+            
+            for row in result.get("results", []):
+                os_name = row[0] or "Unknown"
+                error_msg = row[1] or "No message"
+                session_id = row[2]
+                distinct_id = row[3]
+                timestamp = row[4]
+                url = row[5]
+                
+                # Truncate long error messages
+                if len(str(error_msg)) > 100:
+                    error_msg = str(error_msg)[:100] + "..."
+                
+                error_info = {
+                    "os": os_name,
+                    "message": error_msg,
+                    "session_id": session_id,
+                    "distinct_id": distinct_id,
+                    "timestamp": timestamp,
+                    "url": url
+                }
+                errors_by_type[event]["errors"].append(error_info)
+            
+            # Also store total count
+            errors_by_type[event]["total"] = len(result.get("results", []))
+    
+    return errors_by_type
+
+
+def get_session_replay_url(session_id: str) -> str:
+    """Generate PostHog session replay URL."""
+    if not session_id:
+        return None
+    return f"{POSTHOG_HOST}/project/{POSTHOG_PROJECT_ID}/replay/{session_id}"
 
 
 # =============================================================================
@@ -122,7 +174,7 @@ def send_slack(blocks: list, text: str):
 # =============================================================================
 
 def check_errors():
-    """Check for errors in last 10 mins and report."""
+    """Check for errors in last 10 mins and report with details."""
     check_config()
     
     now = datetime.utcnow()
@@ -133,47 +185,82 @@ def check_errors():
     
     print(f"🚨 Checking errors from {date_from} to {date_to}...")
     
-    errors = get_error_counts(date_from, date_to)
+    errors_by_type = get_error_details(date_from, date_to)
     
-    if not errors:
+    if not errors_by_type:
         print("✅ No errors in last 10 minutes")
         return
     
-    # Build message
-    error_lines = []
-    total_errors = 0
+    # Count total errors
+    total_errors = sum(data["total"] for data in errors_by_type.values())
     
-    event_names = {
-        "app_error_captured": "🐛 App Errors",
-        "$exception": "💥 Exceptions",
-        "buy_provider_availability_error": "💳 Payment Provider Errors",
-        "send_transaction_result": "📤 Send Failures",
-        "swap_execution_result": "🔄 Swap Failures",
-        "$rageclick": "😤 Rage Clicks"
-    }
+    if total_errors == 0:
+        print("✅ No errors in last 10 minutes")
+        return
     
-    for event, counts in errors.items():
-        total = counts["iOS"] + counts["Android"]
-        total_errors += total
-        name = event_names.get(event, event)
-        error_lines.append(f"• {name}: iOS *{counts['iOS']}* · Android *{counts['Android']}*")
-    
+    # Build Slack message
     blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": f"🚨 Error Alert — {total_errors} issues in last 10 min", "emoji": True}},
+        {"type": "header", "text": {"type": "plain_text", "text": f"🚨 {total_errors} errors in last 10 min", "emoji": True}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"_{ten_mins_ago.strftime('%H:%M')} - {now.strftime('%H:%M UTC')}_"}]},
         {"type": "divider"},
-        {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(error_lines)}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": 
-            f"<https://app.posthog.com/project/{POSTHOG_PROJECT_ID}/dashboard/859640|View Error Dashboard> · {now.strftime('%H:%M UTC')}"
-        }]}
     ]
+    
+    for event, data in errors_by_type.items():
+        if not data["errors"]:
+            continue
+        
+        # Section header for error type
+        error_count = data["total"]
+        
+        header_text = f"*{data['name']}* ({error_count})"
+        
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": header_text}})
+        
+        # Individual errors
+        for err in data["errors"]:
+            os_emoji = "🍎" if err["os"] == "iOS" else "🤖"
+            
+            # Build error line
+            error_line = f"{os_emoji} `{err['message']}`"
+            
+            # Add session replay link if available
+            if err["session_id"]:
+                replay_url = get_session_replay_url(err["session_id"])
+                error_line += f"\n     <{replay_url}|▶️ Watch Session>"
+            
+            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": error_line}]})
+        
+        blocks.append({"type": "divider"})
+    
+    # Footer with dashboard link
+    blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": 
+        f"<{POSTHOG_HOST}/project/{POSTHOG_PROJECT_ID}/dashboard/859640|View Error Dashboard> · "
+        f"<{POSTHOG_HOST}/project/{POSTHOG_PROJECT_ID}/events?eventType=$exception|View All Exceptions>"
+    }]})
     
     send_slack(blocks, f"🚨 {total_errors} errors in last 10 min")
 
 
 def test_slack():
-    """Test connection."""
+    """Test connection with sample error format."""
     check_config()
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "✅ *Error reporter connected!*\nYou'll receive alerts every 10 mins (only if errors exist)."}}]
+    
+    sample_replay_url = f"{POSTHOG_HOST}/project/{POSTHOG_PROJECT_ID}/replay/sample-session-id"
+    
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "✅ *Error reporter connected!*"}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*Example error format:*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*💥 Exception* (3 total)"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": 
+            f"🍎 `TypeError: Cannot read property 'x' of undefined`\n     <{sample_replay_url}|▶️ Watch Session>"
+        }]},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": 
+            f"🤖 `NetworkError: Request failed with status 500`\n     <{sample_replay_url}|▶️ Watch Session>"
+        }]},
+        {"type": "divider"},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": "You'll receive alerts every 10 mins (only if errors exist)."}]}
+    ]
     send_slack(blocks, "Test from error reporter")
 
 
