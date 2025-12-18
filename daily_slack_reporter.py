@@ -64,7 +64,7 @@ def query_posthog(query: str) -> dict:
     return response.json()
 
 
-def get_event_count_by_os(event_name: str, date_from: str, date_to: str) -> dict:
+def get_event_count_by_os(event_name: str, date_from: str, date_to: str, extra_filter: str = "") -> dict:
     """Get event counts by OS."""
     query = f"""
         SELECT properties.$os as os, count() as count
@@ -72,6 +72,7 @@ def get_event_count_by_os(event_name: str, date_from: str, date_to: str) -> dict
         WHERE event = '{event_name}'
             AND timestamp >= '{date_from}' AND timestamp < '{date_to}'
             AND (properties.$os = 'iOS' OR properties.$os = 'Android')
+            {extra_filter}
         GROUP BY os ORDER BY count DESC
     """
     result = query_posthog(query)
@@ -102,11 +103,16 @@ def get_unique_users_by_os(event_name: str, date_from: str, date_to: str) -> dic
     return counts
 
 
-def get_real_funnel_conversion(start_event: str, end_event: str, date_from: str, date_to: str) -> dict:
+def get_real_funnel_conversion(start_event: str, end_event: str, date_from: str, date_to: str, end_event_filter: str = "") -> dict:
     """
     Get REAL funnel conversion - users who did start event AND end event.
     Returns: {os: {started: X, completed: Y, rate: Z%}}
     """
+    # Build the end event condition with optional filter
+    end_event_condition = f"event = '{end_event}'"
+    if end_event_filter:
+        end_event_condition = f"(event = '{end_event}' AND {end_event_filter})"
+    
     query = f"""
         SELECT 
             start_os as os,
@@ -116,10 +122,10 @@ def get_real_funnel_conversion(start_event: str, end_event: str, date_from: str,
             SELECT 
                 distinct_id,
                 argMin(properties.$os, timestamp) as start_os,
-                max(CASE WHEN event = '{end_event}' THEN 1 ELSE 0 END) as completed
+                max(CASE WHEN {end_event_condition} THEN 1 ELSE 0 END) as completed
             FROM events
             WHERE 
-                event IN ('{start_event}', '{end_event}')
+                (event = '{start_event}' OR {end_event_condition})
                 AND timestamp >= '{date_from}' 
                 AND timestamp < '{date_to}'
                 AND (properties.$os = 'iOS' OR properties.$os = 'Android')
@@ -225,15 +231,28 @@ def generate_daily_report():
     dau = get_unique_users_by_os("app_launched", date_from, date_to)
     dau_prev = get_unique_users_by_os("app_launched", prev_from, prev_to)
     
-    # Buy completions (raw count)
-    buy = get_event_count_by_os("buy_payment_state_changed", date_from, date_to)
-    buy_prev = get_event_count_by_os("buy_payment_state_changed", prev_from, prev_to)
+    # Buy completions (raw count) - FILTERED BY state = 'completed'
+    buy_state_filter = "AND properties.state = 'completed'"
+    buy = get_event_count_by_os("buy_payment_state_changed", date_from, date_to, buy_state_filter)
+    buy_prev = get_event_count_by_os("buy_payment_state_changed", prev_from, prev_to, buy_state_filter)
     
-    # Buy funnel - Standard flow (form → complete)
-    buy_funnel = get_real_funnel_conversion("buy_form_viewed", "buy_payment_state_changed", date_from, date_to)
+    # Buy funnel - Standard flow (form → complete) - FILTERED BY state = 'completed'
+    buy_funnel = get_real_funnel_conversion(
+        "buy_form_viewed", 
+        "buy_payment_state_changed", 
+        date_from, 
+        date_to,
+        "properties.state = 'completed'"
+    )
     
-    # Buy funnel - Deeplink flow (deeplink → complete)
-    deeplink_funnel = get_real_funnel_conversion("deeplink_intent_viewed", "buy_payment_state_changed", date_from, date_to)
+    # Buy funnel - Deeplink flow (deeplink → complete) - FILTERED BY state = 'completed'
+    deeplink_funnel = get_real_funnel_conversion(
+        "deeplink_intent_viewed", 
+        "buy_payment_state_changed", 
+        date_from, 
+        date_to,
+        "properties.state = 'completed'"
+    )
     
     # Onboarding completions (raw count)
     onboard = get_event_count_by_os("auth_session_ready", date_from, date_to)
