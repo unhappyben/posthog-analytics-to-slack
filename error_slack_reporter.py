@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-PostHog → Slack Error Reporter
-==============================
-Checks for errors every 10 mins and posts to Slack with error details and session replays.
+PostHog → Slack Focused Error Reporter
+=======================================
+Checks for specific error conditions every 10 mins and posts to Slack.
 
 Environment variables:
     POSTHOG_API_KEY       - Your PostHog personal API key
@@ -10,8 +10,8 @@ Environment variables:
     SLACK_WEBHOOK_ERRORS  - Slack webhook for errors channel
 
 Usage:
-    python error_slack_reporter.py
-    python error_slack_reporter.py --test
+    python error_reporter.py
+    python error_reporter.py --test
 """
 
 import os
@@ -32,18 +32,170 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# Error events to monitor
-ERROR_EVENTS = {
-    "app_error_captured": "🐛 App Error",
-    "$exception": "💥 Exception",
-    "buy_provider_availability_error": "💳 Payment Error",
-    "send_transaction_result": "📤 Send Failure",
-    "swap_execution_result": "🔄 Swap Failure",
-    "$rageclick": "😤 Rage Click"
-}
+# =============================================================================
+# ERROR DEFINITIONS
+# Each error has:
+#   - event: PostHog event name
+#   - name: Friendly name for Slack
+#   - emoji: Display emoji
+#   - filter: SQL WHERE condition for the error state (None = any occurrence)
+#   - properties: List of property names to display in Slack
+# =============================================================================
 
-# Max errors to show per type (no limit)
-MAX_ERRORS_PER_TYPE = 100
+ERROR_DEFINITIONS = [
+    # Auth errors
+    {
+        "event": "auth_invite_code_result",
+        "name": "Invite Code Error",
+        "emoji": "🔑",
+        "filter": "properties.status IN ('invalid', 'error')",
+        "properties": ["status", "error"]
+    },
+    {
+        "event": "auth_otp_result",
+        "name": "OTP Error",
+        "emoji": "🔢",
+        "filter": "properties.status = 'error'",
+        "properties": ["status", "error"]
+    },
+    {
+        "event": "auth_consent_decision",
+        "name": "Consent Denied",
+        "emoji": "🚫",
+        "filter": "properties.decision = 'deny'",
+        "properties": ["decision"]
+    },
+    {
+        "event": "auth_logout_failed",
+        "name": "Logout Failed",
+        "emoji": "🚪",
+        "filter": None,  # Any occurrence
+        "properties": ["error"]
+    },
+    
+    # Buy errors
+    {
+        "event": "buy_provider_availability_error",
+        "name": "Provider Availability Error",
+        "emoji": "💳",
+        "filter": None,  # Any occurrence
+        "properties": ["provider", "error"]
+    },
+    {
+        "event": "buy_payment_state_changed",
+        "name": "Payment Failed",
+        "emoji": "💰",
+        "filter": "properties.state = 'failed'",
+        "properties": ["state", "error", "provider"]
+    },
+    
+    # Send errors
+    {
+        "event": "send_validation_error",
+        "name": "Send Validation Error",
+        "emoji": "📤",
+        "filter": None,  # Any occurrence
+        "properties": ["reason"]
+    },
+    {
+        "event": "send_recipient_validation_result",
+        "name": "Recipient Validation Error",
+        "emoji": "👤",
+        "filter": "properties.status IN ('invalid', 'error')",
+        "properties": ["status", "error"]
+    },
+    {
+        "event": "send_transaction_result",
+        "name": "Send Transaction Error",
+        "emoji": "📤",
+        "filter": "properties.status IN ('error', 'cancelled')",
+        "properties": ["status", "error"]
+    },
+    
+    # Sell errors
+    {
+        "event": "sell_result",
+        "name": "Sell Error",
+        "emoji": "💵",
+        "filter": "properties.status = 'error'",
+        "properties": ["status", "provider", "error"]
+    },
+    
+    # Swap errors
+    {
+        "event": "swap_transfer_result",
+        "name": "Swap Transfer Error",
+        "emoji": "🔄",
+        "filter": "properties.status = 'error'",
+        "properties": ["status", "error"]
+    },
+    {
+        "event": "swap_execution_result",
+        "name": "Swap Execution Error",
+        "emoji": "🔄",
+        "filter": "properties.status = 'error'",
+        "properties": ["status", "error"]
+    },
+    {
+        "event": "asset_swap_validation_error",
+        "name": "Swap Validation Error",
+        "emoji": "⚠️",
+        "filter": None,  # Any occurrence
+        "properties": ["reason"]
+    },
+    
+    # Transaction errors
+    {
+        "event": "transaction_cancel_result",
+        "name": "Transaction Cancel Error",
+        "emoji": "❌",
+        "filter": "properties.status = 'error'",
+        "properties": ["status", "error"]
+    },
+    
+    # Profile errors
+    {
+        "event": "profile_biometric_toggled",
+        "name": "Biometric Toggle Failed",
+        "emoji": "👆",
+        "filter": "properties.result = 'failed'",
+        "properties": ["result", "error"]
+    },
+    {
+        "event": "edit_profile_email_update_result",
+        "name": "Email Update Error",
+        "emoji": "📧",
+        "filter": "properties.status = 'error'",
+        "properties": ["status", "error"]
+    },
+    
+    # Deeplink errors
+    {
+        "event": "deeplink_intent_action",
+        "name": "Deeplink Error",
+        "emoji": "🔗",
+        "filter": "properties.action = 'expired' OR properties.reason = 'invalid'",
+        "properties": ["action", "reason"]
+    },
+    
+    # Platform errors
+    {
+        "event": "app_error_captured",
+        "name": "App Error",
+        "emoji": "🐛",
+        "filter": "properties.severity = 'error'",
+        "properties": ["message", "source", "severity"]
+    },
+    {
+        "event": "ui_toast_shown",
+        "name": "Error Toast",
+        "emoji": "🍞",
+        "filter": "properties.tone = 'error'",
+        "properties": ["toast_id", "message"]
+    },
+]
+
+MAX_ERRORS_PER_TYPE = 10  # Limit per error type to avoid huge messages
 
 
 def check_config():
@@ -77,77 +229,55 @@ def query_posthog(query: str) -> dict:
     return response.json()
 
 
-def get_error_details(date_from: str, date_to: str) -> dict:
-    """Get detailed error info including messages and session IDs."""
+def get_errors_for_event(error_def: dict, date_from: str, date_to: str) -> list:
+    """Get errors for a specific event definition."""
     
-    errors_by_type = {}
+    event = error_def["event"]
+    filter_condition = error_def["filter"]
+    props_to_fetch = error_def["properties"]
     
-    for event, friendly_name in ERROR_EVENTS.items():
-        # Build query based on event type to get relevant error message
-        if event == "$exception":
-            message_field = "properties.$exception_message"
-        elif event == "app_error_captured":
-            message_field = "properties.message"
-        elif event == "buy_provider_availability_error":
-            message_field = "concat(properties.error, ' (', properties.provider, ')')"
-        elif event == "send_transaction_result":
-            message_field = "concat(properties.error, ' | ', properties.hash)"
-        elif event == "swap_execution_result":
-            message_field = "properties.error"
-        else:
-            message_field = "properties.message"
-        
-        query = f"""
-            SELECT 
-                properties.$os as os,
-                {message_field} as error_message,
-                properties.$session_id as session_id,
-                distinct_id,
-                timestamp,
-                properties.$current_url as url
-            FROM events
-            WHERE event = '{event}'
-                AND timestamp >= '{date_from}' 
-                AND timestamp < '{date_to}'
-                AND (properties.$os = 'iOS' OR properties.$os = 'Android')
-            ORDER BY timestamp DESC
-            LIMIT 100
-        """
-        
-        result = query_posthog(query)
-        
-        if result and result.get("results"):
-            errors_by_type[event] = {
-                "name": friendly_name,
-                "errors": []
-            }
-            
-            for row in result.get("results", []):
-                os_name = row[0] or "Unknown"
-                error_msg = row[1] or "No message"
-                session_id = row[2]
-                distinct_id = row[3]
-                timestamp = row[4]
-                url = row[5]
-                
-                # Truncate long error messages
-                if len(str(error_msg)) > 100:
-                    error_msg = str(error_msg)[:100] + "..."
-                
-                error_info = {
-                    "os": os_name,
-                    "message": error_msg,
-                    "session_id": session_id,
-                    "distinct_id": distinct_id,
-                    "timestamp": timestamp,
-                    "url": url
-                }
-                errors_by_type[event]["errors"].append(error_info)
-            
-            # Also store total count
-            errors_by_type[event]["total"] = len(result.get("results", []))
+    # Build property select fields
+    prop_selects = ", ".join([f"properties.{p} as {p}" for p in props_to_fetch])
     
-    return errors_by_type
+    # Build WHERE clause
+    where_parts = [
+        f"event = '{event}'",
+        f"timestamp >= '{date_from}'",
+        f"timestamp < '{date_to}'",
+        "(properties.$os = 'iOS' OR properties.$os = 'Android')"
+    ]
+    
+    if filter_condition:
+        where_parts.append(f"({filter_condition})")
+    
+    where_clause = " AND ".join(where_parts)
+    
+    query = f"""
+        SELECT 
+            properties.$os as os,
+            properties.$session_id as session_id,
+            timestamp,
+            {prop_selects}
+        FROM events
+        WHERE {where_clause}
+        ORDER BY timestamp DESC
+        LIMIT {MAX_ERRORS_PER_TYPE}
+    """
+    
+    result = query_posthog(query)
+    
+    errors = []
+    if result and result.get("results"):
+        # Get column names from result
+        columns = result.get("columns", [])
+        
+        for row in result.get("results", []):
+            error = {}
+            for i, col in enumerate(columns):
+                error[col] = row[i]
+            errors.append(error)
+    
+    return errors
 
 
 def get_session_replay_url(session_id: str) -> str:
@@ -171,12 +301,26 @@ def send_slack(blocks: list, text: str):
     return True
 
 
+def format_error_properties(error: dict, props_to_show: list) -> str:
+    """Format error properties for display."""
+    parts = []
+    for prop in props_to_show:
+        value = error.get(prop)
+        if value:
+            # Truncate long values
+            value_str = str(value)
+            if len(value_str) > 80:
+                value_str = value_str[:80] + "..."
+            parts.append(f"{prop}=`{value_str}`")
+    return " · ".join(parts) if parts else "No details"
+
+
 # =============================================================================
 # ERROR REPORT
 # =============================================================================
 
 def check_errors():
-    """Check for errors in last 10 mins and report with details."""
+    """Check for specific errors in last 10 mins and report."""
     check_config()
     
     now = datetime.utcnow()
@@ -187,47 +331,50 @@ def check_errors():
     
     print(f"🚨 Checking errors from {date_from} to {date_to}...")
     
-    errors_by_type = get_error_details(date_from, date_to)
+    # Collect all errors
+    all_errors = {}
+    total_error_count = 0
     
-    if not errors_by_type:
-        print("✅ No errors in last 10 minutes")
-        return
+    for error_def in ERROR_DEFINITIONS:
+        errors = get_errors_for_event(error_def, date_from, date_to)
+        if errors:
+            all_errors[error_def["event"]] = {
+                "definition": error_def,
+                "errors": errors
+            }
+            total_error_count += len(errors)
+            print(f"  Found {len(errors)} {error_def['name']}")
     
-    # Count total errors
-    total_errors = sum(data["total"] for data in errors_by_type.values())
-    
-    if total_errors == 0:
+    if total_error_count == 0:
         print("✅ No errors in last 10 minutes")
         return
     
     # Build Slack message
     blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": f"🚨 {total_errors} errors in last 10 min", "emoji": True}},
+        {"type": "header", "text": {"type": "plain_text", "text": f"🚨 {total_error_count} errors in last 10 min", "emoji": True}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": f"_{ten_mins_ago.strftime('%H:%M')} - {now.strftime('%H:%M UTC')}_"}]},
         {"type": "divider"},
     ]
     
-    for event, data in errors_by_type.items():
-        if not data["errors"]:
-            continue
+    for event_name, data in all_errors.items():
+        error_def = data["definition"]
+        errors = data["errors"]
         
-        # Section header for error type
-        error_count = data["total"]
-        
-        header_text = f"*{data['name']}* ({error_count})"
-        
+        # Section header
+        header_text = f"*{error_def['emoji']} {error_def['name']}* ({len(errors)})"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": header_text}})
         
         # Individual errors
-        for err in data["errors"]:
-            os_emoji = "🍎" if err["os"] == "iOS" else "🤖"
+        for err in errors:
+            os_emoji = "🍎" if err.get("os") == "iOS" else "🤖"
+            props_text = format_error_properties(err, error_def["properties"])
             
-            # Build error line
-            error_line = f"{os_emoji} `{err['message']}`"
+            error_line = f"{os_emoji} {props_text}"
             
             # Add session replay link if available
-            if err["session_id"]:
-                replay_url = get_session_replay_url(err["session_id"])
+            session_id = err.get("session_id")
+            if session_id:
+                replay_url = get_session_replay_url(session_id)
                 error_line += f"\n     <{replay_url}|▶️ Watch Session>"
             
             blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": error_line}]})
@@ -236,11 +383,10 @@ def check_errors():
     
     # Footer with dashboard link
     blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": 
-        f"<{POSTHOG_HOST}/project/{POSTHOG_PROJECT_ID}/dashboard/859640|View Error Dashboard> · "
-        f"<{POSTHOG_HOST}/project/{POSTHOG_PROJECT_ID}/events?eventType=$exception|View All Exceptions>"
+        f"<{POSTHOG_HOST}/project/{POSTHOG_PROJECT_ID}/dashboard/859640|View Error Dashboard>"
     }]})
     
-    send_slack(blocks, f"🚨 {total_errors} errors in last 10 min")
+    send_slack(blocks, f"🚨 {total_error_count} errors in last 10 min")
 
 
 def test_slack():
@@ -250,20 +396,30 @@ def test_slack():
     sample_replay_url = f"{POSTHOG_HOST}/project/{POSTHOG_PROJECT_ID}/replay/sample-session-id"
     
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": "✅ *Error reporter connected!*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "✅ *Focused error reporter connected!*"}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*Monitoring these error conditions:*"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": 
+            "🔑 Invite Code Error · 🔢 OTP Error · 🚫 Consent Denied · 🚪 Logout Failed\n"
+            "💳 Provider Availability · 💰 Payment Failed\n"
+            "📤 Send Validation · 👤 Recipient Validation · 📤 Send Transaction\n"
+            "💵 Sell Error · 🔄 Swap Errors · ⚠️ Swap Validation\n"
+            "❌ Transaction Cancel · 👆 Biometric Failed · 📧 Email Update\n"
+            "🔗 Deeplink Error · 🐛 App Error · 🍞 Error Toast"
+        }]},
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": "*Example error format:*"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": "*💥 Exception* (3 total)"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*💳 Provider Availability Error* (2)"}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": 
-            f"🍎 `TypeError: Cannot read property 'x' of undefined`\n     <{sample_replay_url}|▶️ Watch Session>"
+            f"🍎 provider=`moonpay` · error=`timeout`\n     <{sample_replay_url}|▶️ Watch Session>"
         }]},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": 
-            f"🤖 `NetworkError: Request failed with status 500`\n     <{sample_replay_url}|▶️ Watch Session>"
+            f"🤖 provider=`ramp` · error=`service_unavailable`\n     <{sample_replay_url}|▶️ Watch Session>"
         }]},
         {"type": "divider"},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": "You'll receive alerts every 10 mins (only if errors exist)."}]}
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": "Alerts every 10 mins (only if errors exist)."}]}
     ]
-    send_slack(blocks, "Test from error reporter")
+    send_slack(blocks, "Test from focused error reporter")
 
 
 # =============================================================================
@@ -272,7 +428,7 @@ def test_slack():
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Error PostHog → Slack Reporter")
+    parser = argparse.ArgumentParser(description="Focused Error PostHog → Slack Reporter")
     parser.add_argument("--test", action="store_true", help="Test Slack connection")
     args = parser.parse_args()
     
