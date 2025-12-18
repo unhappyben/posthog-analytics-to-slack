@@ -87,10 +87,12 @@ def get_error_details(date_from: str, date_to: str) -> dict:
         if event == "$exception":
             message_field = "properties.$exception_message"
         elif event == "app_error_captured":
-            message_field = "properties.error_message"
+            message_field = "properties.message"
         elif event == "buy_provider_availability_error":
-            message_field = "properties.provider"
-        elif event in ["send_transaction_result", "swap_execution_result"]:
+            message_field = "concat(properties.error, ' (', properties.provider, ')')"
+        elif event == "send_transaction_result":
+            message_field = "concat(properties.error, ' | ', properties.hash)"
+        elif event == "swap_execution_result":
             message_field = "properties.error"
         else:
             message_field = "properties.message"
